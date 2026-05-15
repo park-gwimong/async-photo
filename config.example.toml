@@ -1,0 +1,32 @@
+# AsyncPhoto 설정 샘플
+# 이 파일을 `config.toml`로 복사한 뒤 본인 환경에 맞게 수정하세요.
+#   cp config.example.toml config.toml
+#   chmod 600 config.toml   # 평문 비밀번호가 들어가므로 권한 제한 권장
+
+[ftp]
+# NAS 호스트 (예: "nas.local", "192.168.0.10")
+host = "nas.local"
+
+# 표준 포트는 21, FTPS(명시적 TLS)도 동일
+port = 21
+
+# FTP 계정
+username = "admin"
+password = ""
+
+# 평문 FTP 대신 FTPS(명시적 TLS)를 쓰면 true
+# 외부 네트워크 너머의 NAS라면 켜두는 것을 강력 권장
+use_tls = false
+
+[sync]
+# NAS에서 동기화할 최상위 경로 (절대경로, POSIX 형식)
+remote_root = "/volume1/photo/raw"
+
+# 로컬 저장 위치 ("~"는 홈 디렉터리)
+local_root = "~/Pictures/AsyncPhoto"
+
+# JPEG 품질(0~100). 88 정도면 시각적으로 거의 무손실에 가까우면서 압축률도 합리적
+jpg_quality = 88
+
+# 동시 다운로드 워커 수 (NAS 부하/대역폭에 맞춰 조절)
+workers = 3

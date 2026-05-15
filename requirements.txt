@@ -1,0 +1,5 @@
+rawpy>=0.21
+Pillow>=10.0
+tqdm>=4.66
+# HEIC/HEIF 지원이 필요하면 주석 해제 (macOS는 brew install libheif 선행)
+# pillow-heif>=0.16

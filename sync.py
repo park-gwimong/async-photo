@@ -31,6 +31,7 @@ try:
     pillow_heif.register_heif_opener()
     HEIC_SUPPORTED = True
 except ImportError:
+    pillow_heif = None
     HEIC_SUPPORTED = False
 
 # rawpy(LibRaw) 로 디코딩할 RAW 포맷
@@ -173,6 +174,52 @@ def _parse_mlsd_modify(s: str) -> int:
         return 0
 
 
+_SKIP_NAMES = {".DS_Store", "Thumbs.db"}
+
+
+def _is_ignored_name(name: str) -> bool:
+    if name in (".", "..") or not name:
+        return True
+    # macOS AppleDouble 사이드카, 숨김 메타파일은 무시
+    return name.startswith("._") or name in _SKIP_NAMES
+
+
+def _entry_as_image(name: str, facts: dict[str, str], full: PurePosixPath) -> RemoteFile | None:
+    if Path(name).suffix.lower() not in SUPPORTED_SUFFIXES:
+        return None
+    size = int(facts.get("size", 0))
+    if size == 0:
+        LOG.warning("빈 파일 건너뜀: %s", full)
+        return None
+    return RemoteFile(size=size, mtime=_parse_mlsd_modify(facts.get("modify", "")))
+
+
+def _scan_directory(
+    entries: list[tuple[str, dict[str, str]]],
+    cur: PurePosixPath,
+    root: PurePosixPath,
+    result: dict[PurePosixPath, RemoteFile],
+    stack: list[PurePosixPath],
+    bar: tqdm,
+) -> int:
+    inspected = 0
+    for name, facts in entries:
+        if _is_ignored_name(name):
+            continue
+        inspected += 1
+        bar.update(1)
+        ftype = facts.get("type", "")
+        full = cur / name
+        if ftype == "dir":
+            stack.append(full)
+        elif ftype == "file":
+            image = _entry_as_image(name, facts, full)
+            if image is not None:
+                result[full.relative_to(root)] = image
+                bar.set_postfix(images=len(result), refresh=False)
+    return inspected
+
+
 def list_remote_images(
     ftp: ftplib.FTP, root: PurePosixPath
 ) -> dict[PurePosixPath, RemoteFile]:
@@ -189,30 +236,7 @@ def list_remote_images(
             except (ftplib.error_perm, ftplib.error_temp, OSError) as e:
                 LOG.warning("디렉터리 읽기 실패: %s (%s)", cur, e)
                 continue
-            for name, facts in entries:
-                if name in (".", "..") or not name:
-                    continue
-                # macOS AppleDouble 사이드카, 숨김 메타파일은 무시
-                if name.startswith("._") or name in {".DS_Store", "Thumbs.db"}:
-                    continue
-                inspected += 1
-                bar.update(1)
-                ftype = facts.get("type", "")
-                full = cur / name
-                if ftype in ("dir", "cdir", "pdir"):
-                    if ftype == "dir":
-                        stack.append(full)
-                elif ftype == "file":
-                    if Path(name).suffix.lower() in SUPPORTED_SUFFIXES:
-                        size = int(facts.get("size", 0))
-                        if size == 0:
-                            LOG.warning("빈 파일 건너뜀: %s", full)
-                            continue
-                        result[full.relative_to(root)] = RemoteFile(
-                            size=size,
-                            mtime=_parse_mlsd_modify(facts.get("modify", "")),
-                        )
-                        bar.set_postfix(images=len(result), refresh=False)
+            inspected += _scan_directory(entries, cur, root, result, stack, bar)
             bar.set_postfix(images=len(result), dirs=dirs_scanned, refresh=False)
     LOG.info(
         "인덱싱 완료: 디렉터리 %d개 / 검토 %d개 / 이미지 %d개",
@@ -251,11 +275,11 @@ def resolve_collisions(
         if len(sources) == 1:
             keep[sources[0]] = remote[sources[0]]
             continue
-        sources.sort(key=lambda r: (_collision_priority(r), str(r)))
+        sources.sort(key=lambda s: (_collision_priority(s), str(s)))
         chosen = sources[0]
         keep[chosen] = remote[chosen]
-        for r in sources[1:]:
-            LOG.warning("이름 충돌로 제외: %s (선택: %s)", r, chosen)
+        for excluded in sources[1:]:
+            LOG.warning("이름 충돌로 제외: %s (선택: %s)", excluded, chosen)
     return keep
 
 
@@ -340,11 +364,11 @@ def worker_ftp(cfg: Config) -> ftplib.FTP:
 
 
 def _reset_worker_ftp() -> None:
-    ftp = getattr(_tls, "ftp", None)
-    if ftp is not None:
+    ftp: ftplib.FTP | None = getattr(_tls, "ftp", None)
+    if isinstance(ftp, ftplib.FTP):
         try:
             ftp.close()
-        except Exception:
+        except (ftplib.all_errors, OSError):
             pass
         _tls.ftp = None
 
@@ -361,7 +385,6 @@ def download_and_convert(
 ) -> tuple[PurePosixPath, bool, str]:
     remote_full = str(cfg.remote_root / rel_remote)
     src_suffix = Path(rel_remote.name).suffix
-    last_err = ""
     image_bytes = b""
     for attempt in range(2):
         try:
@@ -369,10 +392,9 @@ def download_and_convert(
             image_bytes = download_file(ftp, remote_full)
             break
         except (ftplib.error_temp, ftplib.error_proto, EOFError, OSError) as e:
-            last_err = f"전송 실패({type(e).__name__}): {e}"
             _reset_worker_ftp()
             if attempt == 1:
-                return rel_remote, False, last_err
+                return rel_remote, False, f"전송 실패({type(e).__name__}): {e}"
     try:
         dest = cfg.local_root / src_to_jpg_relpath(rel_remote)
         convert_to_jpg(image_bytes, src_suffix, dest, cfg.jpg_quality)
@@ -420,15 +442,106 @@ def prune_empty_dirs(root: Path) -> None:
             pass
 
 
-def main(argv: list[str] | None = None) -> int:
+def _close_ftp_quietly(ftp: ftplib.FTP) -> None:
+    try:
+        ftp.quit()
+    except (ftplib.all_errors, OSError):
+        ftp.close()
+
+
+def _index_nas(cfg: Config) -> dict[PurePosixPath, RemoteFile]:
+    LOG.info(
+        "NAS 인덱싱: %s@%s:%s (FTP%s)",
+        cfg.username,
+        cfg.host,
+        cfg.remote_root,
+        "S" if cfg.use_tls else "",
+    )
+    ftp = make_ftp(cfg)
+    try:
+        return list_remote_images(ftp, cfg.remote_root)
+    finally:
+        _close_ftp_quietly(ftp)
+
+
+def _record_success(
+    rel: PurePosixPath,
+    remote: dict[PurePosixPath, RemoteFile],
+    state: State,
+) -> None:
+    rf = remote[rel]
+    state.update(
+        rel=str(rel),
+        size=rf.size,
+        mtime=rf.mtime,
+        jpg=str(PurePosixPath(*src_to_jpg_relpath(rel).parts)),
+    )
+
+
+def _run_conversions(
+    cfg: Config,
+    to_pull: list[PurePosixPath],
+    remote: dict[PurePosixPath, RemoteFile],
+    state: State,
+) -> list[tuple[PurePosixPath, str]]:
+    failed: list[tuple[PurePosixPath, str]] = []
+    last_save = time.monotonic()
+    try:
+        with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
+            futures = {
+                ex.submit(download_and_convert, cfg, rel): rel for rel in to_pull
+            }
+            with tqdm(total=len(futures), desc="변환", unit="장") as bar:
+                for fut in as_completed(futures):
+                    rel, ok, err = fut.result()
+                    bar.update(1)
+                    if ok:
+                        _record_success(rel, remote, state)
+                        if time.monotonic() - last_save > 10:
+                            state.save()
+                            last_save = time.monotonic()
+                    else:
+                        failed.append((rel, err))
+                        LOG.error("실패 %s: %s", rel, err)
+    finally:
+        state.save()
+    return failed
+
+
+def _apply_deletions(cfg: Config, to_delete: list[str], state: State) -> None:
+    for key in to_delete:
+        entry = state.entries.get(key, {})
+        jpg_rel = entry.get("jpg")
+        if isinstance(jpg_rel, str) and jpg_rel:
+            try:
+                (cfg.local_root / jpg_rel).unlink(missing_ok=True)
+                LOG.info("삭제: %s", jpg_rel)
+            except OSError as e:
+                LOG.error("삭제 실패 %s: %s", jpg_rel, e)
+        state.remove(key)
+    state.save()
+    prune_empty_dirs(cfg.local_root)
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="NAS 이미지 → 로컬 JPG 단방향 동기화")
     parser.add_argument("--config", type=Path, default=Path(__file__).parent / "config.toml")
     parser.add_argument("--delete", action="store_true", help="NAS에 없는 추적 항목의 로컬 JPG 삭제")
     parser.add_argument("--dry-run", action="store_true", help="실행하지 않고 계획만 표시")
     parser.add_argument("--force", action="store_true", help="상태 파일을 무시하고 전부 재변환")
     parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
 
+
+def _print_plan(to_pull: list[PurePosixPath], to_delete: list[str]) -> None:
+    for r in to_pull:
+        print(f"PULL  {r}")
+    for d in to_delete:
+        print(f"DEL   {d}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -439,77 +552,20 @@ def main(argv: list[str] | None = None) -> int:
     state_path = cfg.local_root / STATE_FILENAME
     state = State(state_path, {}) if args.force else State.load(state_path)
 
-    LOG.info(
-        "NAS 인덱싱: %s@%s:%s (FTP%s)",
-        cfg.username,
-        cfg.host,
-        cfg.remote_root,
-        "S" if cfg.use_tls else "",
-    )
-    ftp = make_ftp(cfg)
-    try:
-        remote = list_remote_images(ftp, cfg.remote_root)
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            ftp.close()
-    remote = resolve_collisions(remote)
+    remote = resolve_collisions(_index_nas(cfg))
     LOG.info("원격 이미지 %d개 / 추적 중인 항목 %d개", len(remote), len(state.entries))
 
     to_pull, to_delete = diff(cfg, remote, state)
     LOG.info("변환 대상 %d개 / 삭제 후보 %d개", len(to_pull), len(to_delete))
 
     if args.dry_run:
-        for r in to_pull:
-            print(f"PULL  {r}")
-        for d in to_delete:
-            print(f"DEL   {d}")
+        _print_plan(to_pull, to_delete)
         return 0
 
-    failed: list[tuple[PurePosixPath, str]] = []
-    if to_pull:
-        last_save = time.monotonic()
-        try:
-            with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
-                futures = {
-                    ex.submit(download_and_convert, cfg, rel): rel
-                    for rel in to_pull
-                }
-                with tqdm(total=len(futures), desc="변환", unit="장") as bar:
-                    for fut in as_completed(futures):
-                        rel, ok, err = fut.result()
-                        bar.update(1)
-                        if ok:
-                            rf = remote[rel]
-                            state.update(
-                                rel=str(rel),
-                                size=rf.size,
-                                mtime=rf.mtime,
-                                jpg=str(PurePosixPath(*src_to_jpg_relpath(rel).parts)),
-                            )
-                            if time.monotonic() - last_save > 10:
-                                state.save()
-                                last_save = time.monotonic()
-                        else:
-                            failed.append((rel, err))
-                            LOG.error("실패 %s: %s", rel, err)
-        finally:
-            state.save()
+    failed = _run_conversions(cfg, to_pull, remote, state) if to_pull else []
 
     if args.delete and to_delete:
-        for key in to_delete:
-            entry = state.entries.get(key, {})
-            jpg_rel = entry.get("jpg")
-            if jpg_rel:
-                try:
-                    (cfg.local_root / jpg_rel).unlink(missing_ok=True)
-                    LOG.info("삭제: %s", jpg_rel)
-                except OSError as e:
-                    LOG.error("삭제 실패 %s: %s", jpg_rel, e)
-            state.remove(key)
-        state.save()
-        prune_empty_dirs(cfg.local_root)
+        _apply_deletions(cfg, to_delete, state)
 
     if failed:
         LOG.warning("실패 %d건 (다음 실행에서 자동 재시도)", len(failed))

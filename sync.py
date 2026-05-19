@@ -77,6 +77,7 @@ class Config:
     password: str
     use_tls: bool
     remote_root: PurePosixPath
+    upload_root: PurePosixPath | None
     local_root: Path
     jpg_quality: int
     workers: int
@@ -87,6 +88,7 @@ class Config:
             data = tomllib.load(f)
         ftp = data["ftp"]
         sync = data["sync"]
+        upload_root_raw = sync.get("upload_root") or ""
         return cls(
             host=ftp["host"],
             port=int(ftp.get("port", 21)),
@@ -94,6 +96,7 @@ class Config:
             password=ftp.get("password", ""),
             use_tls=bool(ftp.get("use_tls", False)),
             remote_root=PurePosixPath(sync["remote_root"]),
+            upload_root=PurePosixPath(upload_root_raw) if upload_root_raw else None,
             local_root=Path(sync["local_root"]).expanduser(),
             jpg_quality=int(sync.get("jpg_quality", 88)),
             workers=int(sync.get("workers", 3)),
@@ -138,14 +141,21 @@ class State:
         )
         os.replace(tmp, self.path)
 
-    def update(self, rel: str, size: int, mtime: int, jpg: str) -> None:
+    def update(self, rel: str, size: int, mtime: int, jpg: str, uploaded: bool) -> None:
         with self._lock:
             self.entries[rel] = {
                 "size": size,
                 "mtime": mtime,
                 "jpg": jpg,
+                "uploaded": uploaded,
                 "completed_at": int(time.time()),
             }
+
+    def mark_uploaded(self, rel: str, value: bool = True) -> None:
+        with self._lock:
+            entry = self.entries.get(rel)
+            if entry is not None:
+                entry["uploaded"] = value
 
     def remove(self, rel: str) -> dict[str, Any] | None:
         with self._lock:
@@ -371,6 +381,7 @@ def _reset_worker_ftp() -> None:
         except (ftplib.all_errors, OSError):
             pass
         _tls.ftp = None
+        _tls.ensured_dirs = None
 
 
 def download_file(ftp: ftplib.FTP, path: str) -> bytes:
@@ -379,10 +390,46 @@ def download_file(ftp: ftplib.FTP, path: str) -> bytes:
     return buf.getvalue()
 
 
+def _src_to_jpg_posix(rel: PurePosixPath) -> PurePosixPath:
+    return rel.with_suffix(".jpg")
+
+
+def _ensure_remote_dir(ftp: ftplib.FTP, directory: PurePosixPath) -> None:
+    cache: set[str] | None = getattr(_tls, "ensured_dirs", None)
+    if cache is None:
+        cache = set()
+        _tls.ensured_dirs = cache
+    target = str(directory)
+    if target in cache:
+        return
+    parts = directory.parts
+    if not parts:
+        return
+    cur = PurePosixPath(parts[0])
+    for part in parts[1:]:
+        cur = cur / part
+        s = str(cur)
+        if s in cache:
+            continue
+        try:
+            ftp.mkd(s)
+        except ftplib.error_perm:
+            pass  # 이미 존재하거나 권한 거부
+        cache.add(s)
+    cache.add(target)
+
+
+def upload_file(ftp: ftplib.FTP, local: Path, remote: PurePosixPath) -> None:
+    _ensure_remote_dir(ftp, remote.parent)
+    with local.open("rb") as f:
+        ftp.storbinary(f"STOR {remote}", f)
+
+
 def download_and_convert(
     cfg: Config,
     rel_remote: PurePosixPath,
-) -> tuple[PurePosixPath, bool, str]:
+) -> tuple[PurePosixPath, bool, bool, str]:
+    """(rel, converted, uploaded, err). uploaded는 upload_root 미설정 시 True로 간주."""
     remote_full = str(cfg.remote_root / rel_remote)
     src_suffix = Path(rel_remote.name).suffix
     image_bytes = b""
@@ -394,25 +441,52 @@ def download_and_convert(
         except (ftplib.error_temp, ftplib.error_proto, EOFError, OSError) as e:
             _reset_worker_ftp()
             if attempt == 1:
-                return rel_remote, False, f"전송 실패({type(e).__name__}): {e}"
+                return rel_remote, False, False, f"전송 실패({type(e).__name__}): {e}"
     try:
         dest = cfg.local_root / src_to_jpg_relpath(rel_remote)
         convert_to_jpg(image_bytes, src_suffix, dest, cfg.jpg_quality)
-        return rel_remote, True, ""
     except Exception as e:
         return (
             rel_remote,
             False,
+            False,
             f"변환 실패({len(image_bytes)}B, {src_suffix}, {type(e).__name__}): {e}",
         )
+    if cfg.upload_root is None:
+        return rel_remote, True, True, ""
+    upload_dest = cfg.upload_root / _src_to_jpg_posix(rel_remote)
+    try:
+        upload_file(worker_ftp(cfg), dest, upload_dest)
+        return rel_remote, True, True, ""
+    except (ftplib.all_errors, OSError) as e:
+        _reset_worker_ftp()
+        return rel_remote, True, False, f"업로드 실패({type(e).__name__}): {e}"
+
+
+def upload_only(
+    cfg: Config,
+    rel_remote: PurePosixPath,
+) -> tuple[PurePosixPath, bool, str]:
+    assert cfg.upload_root is not None
+    local_jpg = cfg.local_root / src_to_jpg_relpath(rel_remote)
+    if not local_jpg.exists():
+        return rel_remote, False, "로컬 JPG 없음"
+    upload_dest = cfg.upload_root / _src_to_jpg_posix(rel_remote)
+    try:
+        upload_file(worker_ftp(cfg), local_jpg, upload_dest)
+        return rel_remote, True, ""
+    except (ftplib.all_errors, OSError) as e:
+        _reset_worker_ftp()
+        return rel_remote, False, f"업로드 실패({type(e).__name__}): {e}"
 
 
 def diff(
     cfg: Config,
     remote: dict[PurePosixPath, RemoteFile],
     state: State,
-) -> tuple[list[PurePosixPath], list[str]]:
+) -> tuple[list[PurePosixPath], list[PurePosixPath], list[str]]:
     to_pull: list[PurePosixPath] = []
+    to_upload: list[PurePosixPath] = []
     seen: set[str] = set()
     for rel, rf in remote.items():
         key = str(rel)
@@ -426,8 +500,10 @@ def diff(
             or not jpg_path.exists()
         ):
             to_pull.append(rel)
+        elif cfg.upload_root is not None and not entry.get("uploaded", False):
+            to_upload.append(rel)
     to_delete = sorted(k for k in state.entries if k not in seen)
-    return to_pull, to_delete
+    return to_pull, to_upload, to_delete
 
 
 def prune_empty_dirs(root: Path) -> None:
@@ -468,6 +544,7 @@ def _record_success(
     rel: PurePosixPath,
     remote: dict[PurePosixPath, RemoteFile],
     state: State,
+    uploaded: bool,
 ) -> None:
     rf = remote[rel]
     state.update(
@@ -475,6 +552,7 @@ def _record_success(
         size=rf.size,
         mtime=rf.mtime,
         jpg=str(PurePosixPath(*src_to_jpg_relpath(rel).parts)),
+        uploaded=uploaded,
     )
 
 
@@ -493,10 +571,13 @@ def _run_conversions(
             }
             with tqdm(total=len(futures), desc="변환", unit="장") as bar:
                 for fut in as_completed(futures):
-                    rel, ok, err = fut.result()
+                    rel, converted, uploaded, err = fut.result()
                     bar.update(1)
-                    if ok:
-                        _record_success(rel, remote, state)
+                    if converted:
+                        _record_success(rel, remote, state, uploaded=uploaded)
+                        if not uploaded:
+                            failed.append((rel, err))
+                            LOG.error("업로드 실패 %s: %s", rel, err)
                         if time.monotonic() - last_save > 10:
                             state.save()
                             last_save = time.monotonic()
@@ -508,17 +589,62 @@ def _run_conversions(
     return failed
 
 
+def _run_uploads(
+    cfg: Config,
+    to_upload: list[PurePosixPath],
+    state: State,
+) -> list[tuple[PurePosixPath, str]]:
+    failed: list[tuple[PurePosixPath, str]] = []
+    last_save = time.monotonic()
+    try:
+        with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
+            futures = {ex.submit(upload_only, cfg, rel): rel for rel in to_upload}
+            with tqdm(total=len(futures), desc="업로드", unit="장") as bar:
+                for fut in as_completed(futures):
+                    rel, ok, err = fut.result()
+                    bar.update(1)
+                    if ok:
+                        state.mark_uploaded(str(rel), True)
+                        if time.monotonic() - last_save > 10:
+                            state.save()
+                            last_save = time.monotonic()
+                    else:
+                        failed.append((rel, err))
+                        LOG.error("업로드 실패 %s: %s", rel, err)
+    finally:
+        state.save()
+    return failed
+
+
+def _delete_upload(ftp: ftplib.FTP, path: PurePosixPath) -> None:
+    try:
+        ftp.delete(str(path))
+        LOG.info("NAS 업로드본 삭제: %s", path)
+    except ftplib.error_perm as e:
+        # 550(없음) 등은 무시 가능 수준으로 처리
+        LOG.warning("NAS 삭제 건너뜀 %s: %s", path, e)
+    except (ftplib.all_errors, OSError) as e:
+        LOG.error("NAS 삭제 실패 %s: %s", path, e)
+
+
 def _apply_deletions(cfg: Config, to_delete: list[str], state: State) -> None:
-    for key in to_delete:
-        entry = state.entries.get(key, {})
-        jpg_rel = entry.get("jpg")
-        if isinstance(jpg_rel, str) and jpg_rel:
-            try:
-                (cfg.local_root / jpg_rel).unlink(missing_ok=True)
-                LOG.info("삭제: %s", jpg_rel)
-            except OSError as e:
-                LOG.error("삭제 실패 %s: %s", jpg_rel, e)
-        state.remove(key)
+    nas_ftp = make_ftp(cfg) if cfg.upload_root is not None else None
+    try:
+        for key in to_delete:
+            entry = state.entries.get(key, {})
+            jpg_rel = entry.get("jpg")
+            if isinstance(jpg_rel, str) and jpg_rel:
+                try:
+                    (cfg.local_root / jpg_rel).unlink(missing_ok=True)
+                    LOG.info("삭제: %s", jpg_rel)
+                except OSError as e:
+                    LOG.error("삭제 실패 %s: %s", jpg_rel, e)
+                if nas_ftp is not None and cfg.upload_root is not None and entry.get("uploaded"):
+                    _delete_upload(nas_ftp, cfg.upload_root / jpg_rel)
+            state.remove(key)
+    finally:
+        if nas_ftp is not None:
+            _close_ftp_quietly(nas_ftp)
     state.save()
     prune_empty_dirs(cfg.local_root)
 
@@ -533,9 +659,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _print_plan(to_pull: list[PurePosixPath], to_delete: list[str]) -> None:
+def _print_plan(
+    to_pull: list[PurePosixPath],
+    to_upload: list[PurePosixPath],
+    to_delete: list[str],
+) -> None:
     for r in to_pull:
         print(f"PULL  {r}")
+    for u in to_upload:
+        print(f"UP    {u}")
     for d in to_delete:
         print(f"DEL   {d}")
 
@@ -555,14 +687,26 @@ def main(argv: list[str] | None = None) -> int:
     remote = resolve_collisions(_index_nas(cfg))
     LOG.info("원격 이미지 %d개 / 추적 중인 항목 %d개", len(remote), len(state.entries))
 
-    to_pull, to_delete = diff(cfg, remote, state)
-    LOG.info("변환 대상 %d개 / 삭제 후보 %d개", len(to_pull), len(to_delete))
+    to_pull, to_upload, to_delete = diff(cfg, remote, state)
+    if cfg.upload_root is not None:
+        LOG.info(
+            "변환 대상 %d개 / 업로드 대상 %d개 / 삭제 후보 %d개",
+            len(to_pull),
+            len(to_upload),
+            len(to_delete),
+        )
+    else:
+        LOG.info("변환 대상 %d개 / 삭제 후보 %d개", len(to_pull), len(to_delete))
 
     if args.dry_run:
-        _print_plan(to_pull, to_delete)
+        _print_plan(to_pull, to_upload, to_delete)
         return 0
 
-    failed = _run_conversions(cfg, to_pull, remote, state) if to_pull else []
+    failed: list[tuple[PurePosixPath, str]] = []
+    if to_pull:
+        failed.extend(_run_conversions(cfg, to_pull, remote, state))
+    if to_upload:
+        failed.extend(_run_uploads(cfg, to_upload, state))
 
     if args.delete and to_delete:
         _apply_deletions(cfg, to_delete, state)

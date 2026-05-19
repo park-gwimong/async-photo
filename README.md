@@ -1,12 +1,13 @@
 # AsyncPhoto
 
-NAS에 보관된 RAW/이미지 파일을 FTP로 받아 로컬에 통일된 JPG 포맷으로 단방향 동기화하는 CLI 도구.
+NAS에 보관된 RAW/이미지 파일을 FTP로 받아 로컬에 통일된 JPG 포맷으로 단방향 동기화하는 CLI 도구. 선택적으로 변환된 JPG를 NAS의 다른 경로에 업로드해 공유/뷰어용 폴더로 관리할 수도 있습니다.
 
 ## 특징
 
 - **재실행 안전** — 매니페스트 파일로 처리 상태를 추적해 같은 작업을 중복 수행하지 않음
-- **폴더 구조 유지** — NAS의 디렉터리 트리를 그대로 로컬에 미러링
+- **폴더 구조 유지** — NAS의 디렉터리 트리를 그대로 로컬(과 NAS 업로드본)에 미러링
 - **다양한 포맷 지원** — Nikon NEF를 비롯한 주요 RAW와 일반 이미지(JPG/PNG/TIFF/HEIC/...)를 동일한 JPG 설정으로 통일
+- **NAS 업로드(선택)** — `upload_root` 설정 시 변환한 JPG를 NAS의 별도 경로에 업로드해 뷰어/공유용 갤러리로 관리
 - **충돌 자동 해결** — RAW + 동행 JPG처럼 같은 이름의 원본이 여러 개면 자동으로 하나만 선택
 - **중단 안전** — 중간 저장으로 강제 종료되어도 다음 실행에서 이어감
 
@@ -45,9 +46,10 @@ chmod 600 config.toml
 | | `username` / `password` | FTP 계정 |
 | | `use_tls` | true면 FTPS(명시적 TLS)로 접속 |
 | `[sync]` | `remote_root` | NAS의 동기화 대상 최상위 경로 |
+| | `upload_root` | (선택) 변환한 JPG를 추가로 업로드할 NAS 경로. 비워두면 업로드 비활성화 |
 | | `local_root` | 로컬 저장 위치 (`~` 사용 가능) |
 | | `jpg_quality` | JPEG 품질(0–100, 기본 88) |
-| | `workers` | 동시 다운로드 워커 수 (기본 3) |
+| | `workers` | 동시 다운로드/업로드 워커 수 (기본 3) |
 
 ## 사용
 
@@ -75,7 +77,11 @@ python sync.py -v           # 디버그 로그
 
 ### 변경 감지
 
-각 NAS 파일의 `(상대경로, size, mtime)`을 `local_root/.syncphoto-state.json`에 기록합니다. 다음 실행에서 size 또는 mtime이 바뀐 항목만 다운로드/변환합니다. 로컬 JPG가 사라진 항목은 자동으로 재변환됩니다.
+각 NAS 파일의 `(상대경로, size, mtime, uploaded)`을 `local_root/.syncphoto-state.json`에 기록합니다. 다음 실행에서 size 또는 mtime이 바뀐 항목만 다운로드/변환합니다. 로컬 JPG가 사라진 항목은 자동으로 재변환됩니다. `upload_root`가 설정된 경우, 변환은 끝났지만 업로드가 실패한 항목은 다음 실행에서 업로드 단계만 재시도합니다.
+
+### NAS 업로드
+
+`upload_root`를 설정하면 변환된 JPG를 NAS의 해당 경로에 동일한 폴더 구조로 업로드합니다 (예: `remote_root/2024/IMG.NEF` → `upload_root/2024/IMG.jpg`). 업로드 시 필요한 상위 디렉터리는 자동으로 생성됩니다. `--delete` 사용 시, 추적이 끊긴 항목은 로컬 JPG와 NAS 업로드본을 함께 제거합니다.
 
 ### 이름 충돌
 

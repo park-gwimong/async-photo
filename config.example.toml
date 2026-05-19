@@ -25,8 +25,13 @@ remote_root = "/volume1/photo/raw"
 # 로컬 저장 위치 ("~"는 홈 디렉터리)
 local_root = "~/Pictures/AsyncPhoto"
 
+# 변환한 JPG를 추가로 업로드할 NAS 경로(선택). 비워두면 업로드 비활성화.
+# remote_root 와 같은 디렉터리를 지정하면 원본과 섞이므로 다른 위치 권장.
+# --delete 옵션 사용 시, 추적 항목이 삭제되면 NAS 업로드본도 함께 제거됩니다.
+upload_root = ""
+
 # JPEG 품질(0~100). 88 정도면 시각적으로 거의 무손실에 가까우면서 압축률도 합리적
 jpg_quality = 88
 
-# 동시 다운로드 워커 수 (NAS 부하/대역폭에 맞춰 조절)
+# 동시 다운로드/업로드 워커 수 (NAS 부하/대역폭에 맞춰 조절)
 workers = 3

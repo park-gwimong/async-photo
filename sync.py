@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -133,13 +134,27 @@ class State:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".part")
-        payload = {"version": STATE_VERSION, "entries": self.entries}
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-            "utf-8",
+        payload = json.dumps(
+            {"version": STATE_VERSION, "entries": self.entries},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
         )
-        os.replace(tmp, self.path)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.", suffix=".tmp", dir=str(self.path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, self.path)
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+            raise
 
     def update(self, rel: str, size: int, mtime: int, jpg: str, uploaded: bool) -> None:
         with self._lock:
@@ -378,7 +393,7 @@ def _reset_worker_ftp() -> None:
     if isinstance(ftp, ftplib.FTP):
         try:
             ftp.close()
-        except (ftplib.all_errors, OSError):
+        except ftplib.all_errors:
             pass
         _tls.ftp = None
         _tls.ensured_dirs = None
@@ -458,7 +473,7 @@ def download_and_convert(
     try:
         upload_file(worker_ftp(cfg), dest, upload_dest)
         return rel_remote, True, True, ""
-    except (ftplib.all_errors, OSError) as e:
+    except ftplib.all_errors as e:
         _reset_worker_ftp()
         return rel_remote, True, False, f"업로드 실패({type(e).__name__}): {e}"
 
@@ -475,7 +490,7 @@ def upload_only(
     try:
         upload_file(worker_ftp(cfg), local_jpg, upload_dest)
         return rel_remote, True, ""
-    except (ftplib.all_errors, OSError) as e:
+    except ftplib.all_errors as e:
         _reset_worker_ftp()
         return rel_remote, False, f"업로드 실패({type(e).__name__}): {e}"
 
@@ -521,7 +536,7 @@ def prune_empty_dirs(root: Path) -> None:
 def _close_ftp_quietly(ftp: ftplib.FTP) -> None:
     try:
         ftp.quit()
-    except (ftplib.all_errors, OSError):
+    except ftplib.all_errors:
         ftp.close()
 
 
@@ -623,7 +638,7 @@ def _delete_upload(ftp: ftplib.FTP, path: PurePosixPath) -> None:
     except ftplib.error_perm as e:
         # 550(없음) 등은 무시 가능 수준으로 처리
         LOG.warning("NAS 삭제 건너뜀 %s: %s", path, e)
-    except (ftplib.all_errors, OSError) as e:
+    except ftplib.all_errors as e:
         LOG.error("NAS 삭제 실패 %s: %s", path, e)
 
 
